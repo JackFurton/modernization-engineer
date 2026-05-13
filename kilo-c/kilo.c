@@ -145,6 +145,12 @@ int editorSyntaxToColor(int hl);
 char *editorRowsToString(struct erow *rows, int numrows, int *buflen);
 void editorUpdateSyntax(struct erow *rows, int numrows, struct editorSyntax *syntax, int row_idx);
 void editorUpdateRow(struct erow *rows, int numrows, struct editorSyntax *syntax, int row_idx);
+struct editorSyntax *editorSelectSyntaxHighlight(struct editorSyntax *hldb, int hldb_count, const char *filename);
+void editorInsertRow(struct erow **rows, int *numrows, struct editorSyntax *syntax, int at, const char *s, size_t len);
+void editorDelRow(struct erow **rows, int *numrows, int at);
+void editorRowInsertChar(struct erow *rows, int numrows, struct editorSyntax *syntax, int row_idx, int at, int c);
+void editorRowDelChar(struct erow *rows, int numrows, struct editorSyntax *syntax, int row_idx, int at);
+void editorRowAppendString(struct erow *rows, int numrows, struct editorSyntax *syntax, int row_idx, const char *s, size_t len);
 
 /* =========================== Syntax highlights DB =========================
  *
@@ -375,121 +381,22 @@ failed:
 /* Maps syntax highlight token types to terminal colors. */
 /* editorSyntaxToColor: definition lives in ../kilo-syntax/src/lib.rs */
 
-/* Select the syntax highlight scheme depending on the filename,
- * setting it in the global state E.syntax. */
-void editorSelectSyntaxHighlight(char *filename) {
-    for (unsigned int j = 0; j < HLDB_ENTRIES; j++) {
-        struct editorSyntax *s = HLDB+j;
-        unsigned int i = 0;
-        while(s->filematch[i]) {
-            char *p;
-            int patlen = strlen(s->filematch[i]);
-            if ((p = strstr(filename,s->filematch[i])) != NULL) {
-                if (s->filematch[i][0] != '.' || p[patlen] == '\0') {
-                    E.syntax = s;
-                    return;
-                }
-            }
-            i++;
-        }
-    }
-}
+/* editorSelectSyntaxHighlight: definition lives in ../kilo-syntax/src/lib.rs.
+ * The Rust signature returns the matched syntax (or NULL) — caller assigns
+ * to E.syntax explicitly. */
 
 /* ======================= Editor rows implementation ======================= */
 
 /* editorUpdateRow: definition lives in ../kilo-syntax/src/lib.rs. */
 
-/* Insert a row at the specified position, shifting the other rows on the bottom
- * if required. */
-void editorInsertRow(int at, char *s, size_t len) {
-    if (at > E.numrows) return;
-    E.row = realloc(E.row,sizeof(erow)*(E.numrows+1));
-    if (at != E.numrows) {
-        memmove(E.row+at+1,E.row+at,sizeof(E.row[0])*(E.numrows-at));
-        for (int j = at+1; j <= E.numrows; j++) E.row[j].idx++;
-    }
-    E.row[at].size = len;
-    E.row[at].chars = malloc(len+1);
-    memcpy(E.row[at].chars,s,len+1);
-    E.row[at].hl = NULL;
-    E.row[at].hl_oc = 0;
-    E.row[at].render = NULL;
-    E.row[at].rsize = 0;
-    E.row[at].idx = at;
-    /* Increment numrows BEFORE calling the Rust port — the Rust bounds check
-     * needs the new row to be counted. */
-    E.numrows++;
-    editorUpdateRow(E.row, E.numrows, E.syntax, at);
-    E.dirty++;
-}
-
-/* Free row's heap allocated stuff. */
-void editorFreeRow(erow *row) {
-    free(row->render);
-    free(row->chars);
-    free(row->hl);
-}
-
-/* Remove the row at the specified position, shifting the remainign on the
- * top. */
-void editorDelRow(int at) {
-    erow *row;
-
-    if (at >= E.numrows) return;
-    row = E.row+at;
-    editorFreeRow(row);
-    memmove(E.row+at,E.row+at+1,sizeof(E.row[0])*(E.numrows-at-1));
-    for (int j = at; j < E.numrows-1; j++) E.row[j].idx++;
-    E.numrows--;
-    E.dirty++;
-}
+/* editorInsertRow, editorDelRow, editorRowInsertChar, editorRowDelChar,
+ * editorRowAppendString, and (formerly) editorFreeRow all live in
+ * ../kilo-syntax/src/lib.rs. The dirty flag is incremented by the C
+ * caller after each mutation. */
 
 /* editorRowsToString: definition lives in ../kilo-syntax/src/lib.rs.
  * Note: the signature gained explicit (rows, numrows) parameters — porting
  * away from the global E forces those to be passed. */
-
-/* Insert a character at the specified position in a row, moving the remaining
- * chars on the right if needed. */
-void editorRowInsertChar(erow *row, int at, int c) {
-    if (at > row->size) {
-        /* Pad the string with spaces if the insert location is outside the
-         * current length by more than a single character. */
-        int padlen = at-row->size;
-        /* In the next line +2 means: new char and null term. */
-        row->chars = realloc(row->chars,row->size+padlen+2);
-        memset(row->chars+row->size,' ',padlen);
-        row->chars[row->size+padlen+1] = '\0';
-        row->size += padlen+1;
-    } else {
-        /* If we are in the middle of the string just make space for 1 new
-         * char plus the (already existing) null term. */
-        row->chars = realloc(row->chars,row->size+2);
-        memmove(row->chars+at+1,row->chars+at,row->size-at+1);
-        row->size++;
-    }
-    row->chars[at] = c;
-    editorUpdateRow(E.row, E.numrows, E.syntax, row->idx);
-    E.dirty++;
-}
-
-/* Append the string 's' at the end of a row */
-void editorRowAppendString(erow *row, char *s, size_t len) {
-    row->chars = realloc(row->chars,row->size+len+1);
-    memcpy(row->chars+row->size,s,len);
-    row->size += len;
-    row->chars[row->size] = '\0';
-    editorUpdateRow(E.row, E.numrows, E.syntax, row->idx);
-    E.dirty++;
-}
-
-/* Delete the character at offset 'at' from the specified row. */
-void editorRowDelChar(erow *row, int at) {
-    if (row->size <= at) return;
-    memmove(row->chars+at,row->chars+at+1,row->size-at);
-    editorUpdateRow(E.row, E.numrows, E.syntax, row->idx);
-    row->size--;
-    E.dirty++;
-}
 
 /* Insert the specified char at the current prompt position. */
 void editorInsertChar(int c) {
@@ -501,10 +408,10 @@ void editorInsertChar(int c) {
      * logical representaion of the file, add enough empty rows as needed. */
     if (!row) {
         while(E.numrows <= filerow)
-            editorInsertRow(E.numrows,"",0);
+            editorInsertRow(&E.row, &E.numrows, E.syntax, E.numrows, "", 0);
     }
     row = &E.row[filerow];
-    editorRowInsertChar(row,filecol,c);
+    editorRowInsertChar(E.row, E.numrows, E.syntax, row->idx, filecol, c);
     if (E.cx == E.screencols-1)
         E.coloff++;
     else
@@ -521,7 +428,8 @@ void editorInsertNewline(void) {
 
     if (!row) {
         if (filerow == E.numrows) {
-            editorInsertRow(filerow,"",0);
+            editorInsertRow(&E.row, &E.numrows, E.syntax, filerow, "", 0);
+            E.dirty++;
             goto fixcursor;
         }
         return;
@@ -530,15 +438,16 @@ void editorInsertNewline(void) {
      * think it's just over the last character. */
     if (filecol >= row->size) filecol = row->size;
     if (filecol == 0) {
-        editorInsertRow(filerow,"",0);
+        editorInsertRow(&E.row, &E.numrows, E.syntax, filerow, "", 0);
     } else {
         /* We are in the middle of a line. Split it between two rows. */
-        editorInsertRow(filerow+1,row->chars+filecol,row->size-filecol);
+        editorInsertRow(&E.row, &E.numrows, E.syntax, filerow+1, row->chars+filecol, row->size-filecol);
         row = &E.row[filerow];
         row->chars[filecol] = '\0';
         row->size = filecol;
         editorUpdateRow(E.row, E.numrows, E.syntax, row->idx);
     }
+    E.dirty++;
 fixcursor:
     if (E.cy == E.screenrows-1) {
         E.rowoff++;
@@ -560,8 +469,8 @@ void editorDelChar(void) {
         /* Handle the case of column 0, we need to move the current line
          * on the right of the previous one. */
         filecol = E.row[filerow-1].size;
-        editorRowAppendString(&E.row[filerow-1],row->chars,row->size);
-        editorDelRow(filerow);
+        editorRowAppendString(E.row, E.numrows, E.syntax, filerow-1, row->chars, row->size);
+        editorDelRow(&E.row, &E.numrows, filerow);
         row = NULL;
         if (E.cy == 0)
             E.rowoff--;
@@ -574,7 +483,7 @@ void editorDelChar(void) {
             E.coloff += shift;
         }
     } else {
-        editorRowDelChar(row,filecol-1);
+        editorRowDelChar(E.row, E.numrows, E.syntax, row->idx, filecol-1);
         if (E.cx == 0 && E.coloff)
             E.coloff--;
         else
@@ -610,7 +519,7 @@ int editorOpen(char *filename) {
     while((linelen = getline(&line,&linecap,fp)) != -1) {
         if (linelen && (line[linelen-1] == '\n' || line[linelen-1] == '\r'))
             line[--linelen] = '\0';
-        editorInsertRow(E.numrows,line,linelen);
+        editorInsertRow(&E.row, &E.numrows, E.syntax, E.numrows, line, linelen);
     }
     free(line);
     fclose(fp);
@@ -1087,7 +996,7 @@ int main(int argc, char **argv) {
     }
 
     initEditor();
-    editorSelectSyntaxHighlight(argv[1]);
+    E.syntax = editorSelectSyntaxHighlight(HLDB, HLDB_ENTRIES, argv[1]);
     editorOpen(argv[1]);
     enableRawMode(STDIN_FILENO);
     editorSetStatusMessage(

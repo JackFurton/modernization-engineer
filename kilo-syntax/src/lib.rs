@@ -135,12 +135,283 @@ unsafe fn row_has_open_comment(row: &Erow) -> bool {
     !(render[rsize - 2] == b'*' && render[rsize - 1] == b'/')
 }
 
+/// Walk a NULL-terminated C string and return it as a byte slice. Lifetime is
+/// up to the caller — used here as a borrow tied to the loop iteration.
+unsafe fn cstr_bytes<'a>(ptr: *const c_char) -> &'a [u8] {
+    let mut len = 0usize;
+    while *ptr.add(len) != 0 {
+        len += 1;
+    }
+    slice::from_raw_parts(ptr as *const u8, len)
+}
+
+/// Match `filename` against an HLDB. Patterns starting with '.' match only as
+/// a suffix (extension); others match as a plain substring. Returns a pointer
+/// to the matched `EditorSyntax` entry, or NULL.
+///
+/// # Safety
+/// - `hldb` must point to `hldb_count` valid `EditorSyntax` entries.
+/// - Each entry's `filematch` must be a NULL-terminated array of valid C strings.
+/// - `filename` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn editorSelectSyntaxHighlight(
+    hldb: *mut EditorSyntax,
+    hldb_count: c_int,
+    filename: *const c_char,
+) -> *mut EditorSyntax {
+    if hldb.is_null() || hldb_count <= 0 || filename.is_null() {
+        return ptr::null_mut();
+    }
+    let fname = cstr_bytes(filename);
+
+    for j in 0..hldb_count as usize {
+        let s = hldb.add(j);
+        let filematch = (*s).filematch;
+        if filematch.is_null() {
+            continue;
+        }
+        let mut i = 0usize;
+        loop {
+            let pat_ptr = *filematch.add(i);
+            if pat_ptr.is_null() {
+                break;
+            }
+            let pat = cstr_bytes::<'_>(pat_ptr);
+            if let Some(pos) = fname.windows(pat.len()).position(|w| w == pat) {
+                // Extension patterns must match at end; others match anywhere.
+                let is_extension = pat.first() == Some(&b'.');
+                if !is_extension || pos + pat.len() == fname.len() {
+                    return s;
+                }
+            }
+            i += 1;
+        }
+    }
+    ptr::null_mut()
+}
+
 unsafe fn keyword_slice(ptr: *const c_char) -> &'static [u8] {
     let mut len = 0usize;
     while *ptr.add(len) != 0 {
         len += 1;
     }
     slice::from_raw_parts(ptr as *const u8, len)
+}
+
+/// Private helper: free a row's three heap-allocated fields. Was
+/// `editorFreeRow` in kilo.c; its only caller (editorDelRow) is now Rust too,
+/// so this is no longer exported.
+unsafe fn free_row_internal(row: *mut Erow) {
+    if row.is_null() {
+        return;
+    }
+    let r = &mut *row;
+    if !r.render.is_null() {
+        libc::free(r.render as *mut libc::c_void);
+        r.render = ptr::null_mut();
+    }
+    if !r.chars.is_null() {
+        libc::free(r.chars as *mut libc::c_void);
+        r.chars = ptr::null_mut();
+    }
+    if !r.hl.is_null() {
+        libc::free(r.hl as *mut libc::c_void);
+        r.hl = ptr::null_mut();
+    }
+}
+
+/// Insert a new row at position `at`. Reallocates the row array (so we take
+/// `rows: **Erow` and write back the new base pointer), copies `len` bytes
+/// from `s` into the new row's chars, then runs editorUpdateRow on it.
+///
+/// # Safety
+/// - `rows` must point at the location holding the C-side `E.row` pointer.
+/// - `numrows` must point at the C-side `E.numrows`.
+/// - `s` must be readable for `len` bytes (or NULL when len==0).
+/// - All existing rows in the array must be valid `Erow` values.
+#[no_mangle]
+pub unsafe extern "C" fn editorInsertRow(
+    rows: *mut *mut Erow,
+    numrows: *mut c_int,
+    syntax: *const EditorSyntax,
+    at: c_int,
+    s: *const c_char,
+    len: usize,
+) {
+    if rows.is_null() || numrows.is_null() {
+        return;
+    }
+    let n = *numrows;
+    if at < 0 || at > n {
+        return;
+    }
+
+    let new_n = n + 1;
+    let new_size = (new_n as usize) * core::mem::size_of::<Erow>();
+    let new_rows = libc::realloc(*rows as *mut libc::c_void, new_size) as *mut Erow;
+    if new_rows.is_null() {
+        return;
+    }
+    *rows = new_rows;
+
+    if at != n {
+        // shift rows [at..n] down by one
+        let src = new_rows.add(at as usize);
+        let dst = new_rows.add((at + 1) as usize);
+        ptr::copy(src, dst, (n - at) as usize);
+        // bump idx of the shifted rows
+        for j in (at + 1)..=n {
+            (*new_rows.add(j as usize)).idx += 1;
+        }
+    }
+
+    let new_row = &mut *new_rows.add(at as usize);
+    new_row.idx = at;
+    new_row.size = len as c_int;
+    new_row.rsize = 0;
+    new_row.hl_oc = 0;
+    new_row.hl = ptr::null_mut();
+    new_row.render = ptr::null_mut();
+
+    let chars_buf = libc::malloc(len + 1) as *mut c_char;
+    new_row.chars = chars_buf;
+    if !chars_buf.is_null() {
+        if !s.is_null() && len > 0 {
+            ptr::copy_nonoverlapping(s, chars_buf, len);
+        }
+        *chars_buf.add(len) = 0;
+    }
+
+    *numrows = new_n;
+    editorUpdateRow(new_rows, new_n, syntax, at);
+}
+
+/// Remove row at `at`. Frees its heap buffers, shifts subsequent rows up.
+///
+/// Fixes a kilo bug: the C original bumps `idx++` for shifted rows when it
+/// should bump `idx--`. The shifted rows moved up in the array, so their
+/// stored index should decrease, not increase.
+#[no_mangle]
+pub unsafe extern "C" fn editorDelRow(
+    rows: *mut *mut Erow,
+    numrows: *mut c_int,
+    at: c_int,
+) {
+    if rows.is_null() || numrows.is_null() {
+        return;
+    }
+    let n = *numrows;
+    if at < 0 || at >= n {
+        return;
+    }
+    let arr = *rows;
+    free_row_internal(arr.add(at as usize));
+
+    if at + 1 < n {
+        let src = arr.add((at + 1) as usize);
+        let dst = arr.add(at as usize);
+        ptr::copy(src, dst, (n - at - 1) as usize);
+    }
+    // bug fix: decrement idx for rows that moved up (kilo.c had ++ here)
+    for j in at..(n - 1) {
+        (*arr.add(j as usize)).idx -= 1;
+    }
+    *numrows = n - 1;
+}
+
+/// Insert byte `c` into the row at `row_idx`, at position `at`. If `at` is
+/// past the end of the row, pads with spaces first. Reruns editorUpdateRow.
+#[no_mangle]
+pub unsafe extern "C" fn editorRowInsertChar(
+    rows: *mut Erow,
+    numrows: c_int,
+    syntax: *const EditorSyntax,
+    row_idx: c_int,
+    at: c_int,
+    c: c_int,
+) {
+    if rows.is_null() || row_idx < 0 || row_idx >= numrows {
+        return;
+    }
+    let row = &mut *rows.add(row_idx as usize);
+    let size = row.size.max(0) as usize;
+    let at = at.max(0) as usize;
+
+    if at > size {
+        let padlen = at - size;
+        let new_chars = libc::realloc(row.chars as *mut libc::c_void, size + padlen + 2) as *mut c_char;
+        if new_chars.is_null() {
+            return;
+        }
+        row.chars = new_chars;
+        libc::memset(new_chars.add(size) as *mut libc::c_void, b' ' as c_int, padlen);
+        *new_chars.add(size + padlen + 1) = 0;
+        row.size = (size + padlen + 1) as c_int;
+    } else {
+        let new_chars = libc::realloc(row.chars as *mut libc::c_void, size + 2) as *mut c_char;
+        if new_chars.is_null() {
+            return;
+        }
+        row.chars = new_chars;
+        // shift [at..=size] -> [at+1..=size+1] (includes the nul at index size)
+        ptr::copy(new_chars.add(at), new_chars.add(at + 1), size - at + 1);
+        row.size = (size + 1) as c_int;
+    }
+    *row.chars.add(at) = c as c_char;
+
+    editorUpdateRow(rows, numrows, syntax, row_idx);
+}
+
+/// Delete byte at position `at` from the row at `row_idx`.
+#[no_mangle]
+pub unsafe extern "C" fn editorRowDelChar(
+    rows: *mut Erow,
+    numrows: c_int,
+    syntax: *const EditorSyntax,
+    row_idx: c_int,
+    at: c_int,
+) {
+    if rows.is_null() || row_idx < 0 || row_idx >= numrows {
+        return;
+    }
+    let row = &mut *rows.add(row_idx as usize);
+    let size = row.size.max(0) as usize;
+    let at = at.max(0) as usize;
+    if at >= size {
+        return;
+    }
+    // shift down [at+1..=size] -> [at..size]; size-at+1 bytes including nul
+    ptr::copy(row.chars.add(at + 1), row.chars.add(at), size - at);
+    row.size = (size - 1) as c_int;
+    editorUpdateRow(rows, numrows, syntax, row_idx);
+}
+
+/// Append `len` bytes from `s` to the row at `row_idx`.
+#[no_mangle]
+pub unsafe extern "C" fn editorRowAppendString(
+    rows: *mut Erow,
+    numrows: c_int,
+    syntax: *const EditorSyntax,
+    row_idx: c_int,
+    s: *const c_char,
+    len: usize,
+) {
+    if rows.is_null() || row_idx < 0 || row_idx >= numrows {
+        return;
+    }
+    let row = &mut *rows.add(row_idx as usize);
+    let size = row.size.max(0) as usize;
+    let new_chars = libc::realloc(row.chars as *mut libc::c_void, size + len + 1) as *mut c_char;
+    if new_chars.is_null() {
+        return;
+    }
+    row.chars = new_chars;
+    if !s.is_null() && len > 0 {
+        ptr::copy_nonoverlapping(s, new_chars.add(size), len);
+    }
+    *new_chars.add(size + len) = 0;
+    row.size = (size + len) as c_int;
+    editorUpdateRow(rows, numrows, syntax, row_idx);
 }
 
 /// Rebuild `row->render` (with tabs expanded to spaces aligned to TAB_STOP=8)

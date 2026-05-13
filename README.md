@@ -25,14 +25,21 @@ kilo-syntax/    The Rust staticlib that kilo-c links in. Each function here
 
 All of these live in `kilo-syntax/src/lib.rs` and are linked into the C binary:
 
-| Function                  | Lines (C) | Notable                                            |
-|---------------------------|-----------|----------------------------------------------------|
-| `editorSyntaxToColor`     | ~11       | Pure function, warm-up port                        |
-| `editorRowsToString`      | ~22       | Returns libc-malloc'd buffer; C free()s it         |
-| `is_separator`            | ~3        | Internalized as Rust-private helper                |
-| `editorRowHasOpenComment` | ~6        | Internalized as Rust-private helper                |
-| `editorUpdateSyntax`      | ~140      | State machine + recursion across rows              |
-| `editorUpdateRow`         | ~30       | Tab expansion + delegates to `editorUpdateSyntax`  |
+| Function                       | Lines (C) | Notable                                                       |
+|--------------------------------|-----------|---------------------------------------------------------------|
+| `editorSyntaxToColor`          | ~11       | Pure function, warm-up port                                   |
+| `editorRowsToString`           | ~22       | Returns libc-malloc'd buffer; C free()s it                    |
+| `is_separator`                 | ~3        | Internalized as Rust-private helper                           |
+| `editorRowHasOpenComment`      | ~6        | Internalized as Rust-private helper                           |
+| `editorUpdateSyntax`           | ~140      | State machine + recursion across rows                         |
+| `editorUpdateRow`              | ~30       | Tab expansion + delegates to `editorUpdateSyntax`             |
+| `editorSelectSyntaxHighlight`  | ~17       | filename→syntax matcher; converted side-effect → return value |
+| `editorFreeRow`                | ~5        | Internalized as Rust-private helper                           |
+| `editorInsertRow`              | ~20       | Reallocs the row array (`**Erow` for pointer-update FFI)      |
+| `editorDelRow`                 | ~12       | Fixes kilo bug: idx++ → idx-- after upward shift              |
+| `editorRowInsertChar`          | ~20       | Reallocs chars buffer; handles pad-past-end case              |
+| `editorRowDelChar`             | ~5        | memmove-based byte removal                                    |
+| `editorRowAppendString`        | ~6        | Concatenation; reallocs chars                                 |
 
 The C side keeps prototype declarations near the top of `kilo.c`; the deleted
 bodies are replaced with breadcrumb comments pointing at the Rust source.
@@ -71,10 +78,14 @@ kind of thing that's easy to forget by the next port:
   explicit params. Diffs at call sites are the visible scar of how much hidden
   coupling was there.
 
-- **Fidelity beats fix.** kilo's tab expansion is slightly off-by-one from
-  the standard convention (a leading tab produces 7 spaces, not 8). The port
-  preserves the quirk. Modernization is behavior-preserving by default;
-  "improvements" need authorization.
+- **Fidelity beats fix — usually.** kilo's tab expansion is slightly off-by-one
+  from the standard convention (a leading tab produces 7 spaces, not 8). The
+  port preserves the quirk. Modernization is behavior-preserving by default;
+  "improvements" need authorization. The exception is bugs that would actively
+  corrupt state — kilo's `editorDelRow` bumps `idx++` for shifted-up rows when
+  it should bump `idx--`, which silently causes subsequent edits to target the
+  wrong row in our ported code (Rust's bounds check would just early-return).
+  That one we fixed and noted.
 
 - **Verification harnesses live and die by you writing them.** Compile-time
   guarantees can't catch ABI drift or behavioral divergence across an FFI.
